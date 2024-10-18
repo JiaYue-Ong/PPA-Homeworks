@@ -494,10 +494,6 @@ and rail). These factors were selected after iterations, optimizing for
 accuracy and generalizability.</p>
 <div id="count-of-risk-factors-by-grid-cell" class="section level2">
 <h2>3.1 Count of risk factors by grid cell</h2>
-<p>#Correlative Analysis: Small multiple scatterplots showing
-correlations between your outcome and risk factors, and small multiple
-maps of your risk factors in the fishnet (counts, distance and/or other
-feature engineering approaches).</p>
 <p>I examine the count of each risk factors by grid cell through five
 small multiple maps. They follow different spatial process. Liquor and
 Entertainment venues, Rail Stations, Restaurants and Markets appear are
@@ -789,14 +785,14 @@ pockets are used to predict the location of pick pockets from 2018.</p>
 <p>For my analysis, I downloaded data of 2018 pickpocket from Chicago
 Open Data site. I then computed the Kernel Density on 2017 pick pockets,
 scaling the kernel density values to 1-100 and reclassifying the scaled
-values to 5 risk categories. I then sptatial join the density and count
+values to 5 risk categories. I then spatial join the density and count
 of pickpockets in 2018 for each grid cell to the fishnet. The same
 process is repeated form risk predictions and the results are plotted in
 Figure 9 and 10.</p>
 <p>Figure 9 shows the risk categories for both model types with a sample
 of Pickpocket18 points overlaid. A strongly fit model should show that
 the highest risk category is uniquely targeted to places with a high
-density of burglary points.</p>
+density of pickpocket points.</p>
 <p>Figure 10 calculates the rate of 2018 pickpocket points by risk
 category and model type. A well fit model should show that the risk
 predictions capture a greater share of 2018 pickpocket in the highest
