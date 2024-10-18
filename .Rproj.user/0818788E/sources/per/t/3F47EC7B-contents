@@ -1,0 +1,469 @@
+---
+title: "PPA Homework 3"
+author: "Jia Yue"
+date: "2024-10-18"
+output: html_document:
+  code_folding: hide
+
+---
+
+Your job is to build a version of the spatial risk model seen in the book (and in the Week 6 "Predictive Policing" lab) for a different outcome* that likely suffers from more selection bias than burglary. You can build this model in Chicago or any other city with sufficient open data resources.
+
+(Buildings, Cars, Graffiti, Liquor, Sanitation, Street Lights)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = 'hide',warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat.explore)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(classInt)
+library(geotools) #For reading KMZ Files
+
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+```
+
+#1. Introduction: 1-2 paragraphs identifying your outcome of interest (dependent variable) and explaining why you think bias may be more of an issue than in our class example.
+
+Selection bias occurs when "individuals or groups in a study differ systematically from the population of interest leading to a systematic error in an association or outcome" (Nunan, et al., 2017). In the case of policing data, selection bias can arise from selective enforcement due to an "officer’s preconceived or biased beliefs" (Steif, 2021). For instance, patrolling neighborhood with perceived higher crime rates may lead to an under reporting of crimes in other neighborhood. Crime predictions based on such data will not be able to generalise across space.
+
+I select pick-pocketing as my outcome that likely suffers from more selection bias than burglary. This is because the data only shows for cases where the pick pocket is caught. When a person finds out they have been pick pocketed, it is unlikely they knew exactly when and where the incident occurred. They could make a police report, but it is also possible victims choose to not report as they do not know if the item is recoverable.
+
+For my analysis, I focus on the City of Chicago in 2017. The code below loads data of the number of pick pocket crime in 2017 from Chicago Data Portal and Chicago Municipal Boundary
+
+```{r load data, echo=FALSE}
+Pickpocket17 <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2017/d62x-nvdr") %>% 
+    filter(Primary.Type == "THEFT" & Description == "POCKET-PICKING") %>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+```
+
+#2.1 Maps of your outcome of interest in point form and in fishnet form.
+Figure 1.1 and Figure 1.2 show the maps of pick pocket incidents in point and fishnet respectively. It is interesting to note that pick pocket appear clustered in the East of Chicago.
+```{r Maps of outcome of interest, echo=FALSE}
+#Pickpocket in point form
+plot1<-
+  ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = Pickpocket17, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Figure 1.1\nCount of Pick Pocket in Point, Chicago - 2017") +
+  mapTheme()
+
+#Pickpocket in fishnet form
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            # fast way to select intersecting polygons
+  st_sf() %>%
+  mutate(uniqueID = 1:n())
+
+crime_net <- 
+  dplyr::select(Pickpocket17) %>% 
+  mutate(countPickpocket = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countPickpocket = replace_na(countPickpocket, 0),
+         uniqueID = 1:n(),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+plot2<-
+  ggplot() +
+  geom_sf(data = crime_net, aes(fill = countPickpocket), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Figure 1.2\nCount of Pick Pocket in Fishnet, Chicago - 2017 (Cell Size=500)",fill="Pick Pocket\nCount") +
+  mapTheme()
+
+grid.arrange(ncol=2,plot1,plot2)
+```
+
+#2.2 Risk factors
+For my modeling, I chose four risk factors that I believe are associated with pickpocketing. These factors were selected based on the premise that pickpockets tend to operate in environments where their victims are least situationally aware. The four risk factors are 1) Street Lights out, 2) Liquor and Entertainment venues (excluding liquor store), 3) Restaurants and Markets and 4) Public Transport Stations (bus and rail).
+
+```{r Risk factors, echo=FALSE}
+#Risk Factor 1: Street Lights
+streetLightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Street_Lights_Out")
+
+#Risk Factor 2: Liquor and Entertainment (excluding liquor stores)
+LiquorEntertainment <- 
+  read.socrata("https://data.cityofchicago.org/resource/nrmj-3kcf.json") %>%  
+    filter(business_activity != "Retail Sales of Packaged Liquor") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Liquor_and_Entertainment")
+
+#Risk Factor 3: Restaurants and Markets
+FnB <-
+read.socrata("https://data.cityofchicago.org/resource/uupf-x98q.json")%>%
+  filter(business_activity=="Retail Sales of Perishable Foods") %>%
+  dplyr::select(Y = latitude, X = longitude)%>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Restaurants_and_Markets")
+
+#Risk Factor 4: Public Transport facilities
+RailStations <-st_read("CTA_RailStations")%>%
+  dplyr::select(geometry)%>%
+    na.omit() %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Rail_Stations")
+
+BusStops<-st_read("CTA_BusStops")%>%
+  dplyr::select(geometry)%>%
+    na.omit() %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Bus_Stops")
+
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+```
+
+#3. Correlative Analysis: Small multiple scatterplots showing correlations between your outcome and risk factors, and small multiple maps of your risk factors in the fishnet (counts, distance and/or other feature engineering approaches).
+```{r Small Multiple Maps, echo=FALSE}
+#Small Multiple Maps counting number of risk factors in the fishnet
+vars_net <- 
+  rbind(streetLightsOut,
+        LiquorEntertainment,
+        FnB,
+        RailStations,
+        BusStops) %>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+    full_join(fishnet) %>%
+    spread(Legend, count, fill=0) %>%
+    st_sf() %>%
+    dplyr::select(-`<NA>`) %>%
+    na.omit() %>%
+    ungroup()
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Figure 2: Risk Factors by Fishnet"))
+```
+
+```{r Correlation}
+#Correlation Scatterplots
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+correlation.long <-
+  st_drop_geometry(final_net) %>%
+    dplyr::select(-uniqueID, -cvID) %>%
+    gather(Variable, Value, -countPickpocket)
+
+correlation.cor <-
+  correlation.long %>%
+    group_by(Variable) %>%
+    summarize(correlation = cor(Value, countPickpocket, use = "complete.obs"))
+    
+ggplot(correlation.long, aes(Value, countPickpocket)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") +
+  labs(title = "Figure 3: Pick Pocket count as a function of risk factors") +
+  plotTheme()
+```
+
+#4. Local Moran’s I-related small multiple map of your outcome
+Local Moran's I is used to test for clustering at more local scales. The null hypothesis is that pickpocket count at a given location is randomly distributed relative to its immediate neighbors. Figure 4 below describes the local spatial process of pick pocket. The relatively high values of I represent strong and statistically significant evidence of local clustering at 5% level of significance. This is further supported by the p-value and significant hotspot maps. 
+
+```{r Morans I}
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+print(final_net.weights, zero.policy=TRUE)
+
+local_morans <- localmoran(final_net$countPickpocket, final_net.weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+# Join local Moran's I results to fishnet
+final_net.localMorans <- 
+  cbind(local_morans, as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Pickpocket_Count = countPickpocket, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.05, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+
+vars <- unique(final_net.localMorans$Variable)
+varList <- list()
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(final_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme(title_size = 14) + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 4, top = "Figure 4: Local Morans I statistics, Pick Pocket"))
+
+final_net <-
+  final_net %>% 
+  mutate(Pickpocket.isSig = 
+           ifelse(localmoran(final_net$countPickpocket, 
+                             final_net.weights)[,5] <= 0.0000001, 1, 0)) %>%
+  mutate(Pickpocket.isSig.dist = 
+           nn_function(st_coordinates(st_centroid(final_net)),
+                       st_coordinates(st_centroid(
+                         filter(final_net, Pickpocket.isSig == 1))), k=1))
+
+ggplot() +
+      geom_sf(data = final_net, aes(fill=Pickpocket.isSig.dist), colour=NA) +
+      scale_fill_viridis(name="Pickpocket.isSig.dist") +
+      labs(title="Figure 5: Distance to highly significant pick pocket hotspots") +
+      mapTheme()
+```
+
+#5. Make a model, and validate it using EITHER random k-fold OR spatial cross validation (LOGO-CV).
+error here to resolve
+```{r spatial cross validation (LOGO-CV), results="hide"}
+#Visualise the distribution of pick pocket
+ggplot(final_net,aes(x=countPickpocket))+
+  geom_bar()
+
+#Cross-validated Poisson Regression
+reg.vars <- c("street_Lights_Out", "Liquor_and_Entertainment", "Restaurants_and_Markets", 
+              "Rail_Stations", "Bus_Stops")
+reg.ss.vars <- c("street_Lights_Out", "Liquor_and_Entertainment", "Restaurants_and_Markets", 
+              "Rail_Stations", "Bus_Stops")
+
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countPickpocket",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, countPickpocket, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countPickpocket",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countPickpocket, Prediction, geometry)
+```
+
+#6. A histogram of model errors. (Figure 5.16)
+```{r Histogram of model errors}
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - countPickpocket,
+                             Regression = "Random k-fold CV: Just Risk Factors"),
+                             
+    mutate(reg.ss.cv,        Error = Prediction - countPickpocket,
+                             Regression = "Random k-fold CV: Spatial Process")) %>%
+    st_sf()
+
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - countPickpocket, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
+    facet_wrap(~Regression) +  
+    geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 20, by = 1)) + 
+    labs(title="Distribution of MAE", subtitle = "k-fold cross validation",
+         x="Mean Absolute Error", y="Count") +
+    plotTheme()
+```
+
+#7. Map of model errors
+```{r Map of model errors}
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "k-fold")) %>%
+  ggplot() +
+    geom_sf(aes(fill = MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis() +
+    labs(title = "Vehicle Offence errors by k-fold Regression") +
+    mapTheme() + theme(legend.position="bottom")
+```
+
+#8. A table of MAE and error SD by regression type, and a table of raw errors (e.g. counts) - by neighborhood demographic context - this means you will need to attach census information to your neighborhoods using tidycensus (see book Section 5.53).
+```{r MAE and error SD}
+census_api_key("dea28a23f0b75d54e9eea0421b87003d3bd5c2d9", overwrite = TRUE)
+
+tracts18 <- 
+  get_acs(geography = "tract", variables = c("B01001_001E","B01001A_001E"), 
+          year = 2018, state=17, county=031, geometry=T) %>%
+  st_transform('ESRI:102271')  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01001_001,
+         NumberWhites = B01001A_001) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority_White", "Majority_Non_White")) %>%
+  .[neighborhoods,]
+
+reg.summary %>% 
+  filter(str_detect(Regression, "k-fold")) %>%
+    st_centroid() %>%
+    st_join(tracts18) %>%
+    na.omit() %>%
+      st_drop_geometry() %>%
+      group_by(Regression, raceContext) %>%
+      summarize(mean.Error = mean(Error, na.rm = T)) %>%
+      spread(raceContext, mean.Error) %>%
+      kable(caption = "Mean Error by neighborhood racial context") %>%
+        kable_styling("striped", full_width = F) 
+```
+
+#9. A map and a bar plot comparing kernel density to risk predictions for the next year’s crime.
+```{r kernel density to risk predictions}
+Pickpocket18<-
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2018/3i3m-jwuy") %>% 
+    filter(Primary.Type == "THEFT" & Description == "POCKET-PICKING") %>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+#Kernel Width
+vehicle_ppp <- as.ppp(st_coordinates(Pickpocket17), W = st_bbox(final_net))
+vehicle_KD.1000 <- spatstat.explore::density.ppp(vehicle_ppp, 1000)
+
+#Incident
+vehicle_KDE_sum <- as.data.frame(vehicle_KD.1000) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) 
+
+
+kde_breaks <- classIntervals(vehicle_KDE_sum$value, 
+                             n = 5, "fisher")
+
+
+vehicle_KDE_sf <- vehicle_KDE_sum %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = classInt::findCols(kde_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(Pickpocket18) %>% mutate(vehicleCount = 1), ., sum) %>%
+    mutate(vehicleCount = replace_na(vehicleCount, 0))) %>%
+  dplyr::select(label, Risk_Category, vehicleCount)
+
+#Predictions
+ml_breaks <- classIntervals(reg.ss.cv$Prediction, 
+                             n = 5, "fisher")
+vehicle_risk_sf <-
+  reg.ss.cv %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category =classInt::findCols(ml_breaks),
+         Risk_Category = case_when(
+           Risk_Category == 5 ~ "5th",
+           Risk_Category == 4 ~ "4th",
+           Risk_Category == 3 ~ "3rd",
+           Risk_Category == 2 ~ "2nd",
+           Risk_Category == 1 ~ "1st")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(Pickpocket18) %>% mutate(vehicleCount = 1), ., sum) %>%
+      mutate(vehicleCount = replace_na(vehicleCount, 0))) %>%
+  dplyr::select(label,Risk_Category, vehicleCount)
+
+#Map
+rbind(vehicle_KDE_sf, vehicle_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(Pickpocket18, 3000, replace = TRUE), size = .5, colour = "black") + #check reaplce = TRUE
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2017 vehicle risk predictions; 2018 vehicle") +
+    mapTheme(title_size = 14)
+
+#Bar Plot
+rbind(vehicle_KDE_sf, vehicle_risk_sf) %>%
+  st_drop_geometry() %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countPickpocket = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Pcnt_of_test_set_crimes = countPickpocket / sum(countPickpocket)) %>%
+    ggplot(aes(Risk_Category,Pcnt_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE, name = "Model") +
+      labs(title = "Risk prediction vs. Kernel density, 2018 Pickpocket",
+           y = "% of Test Set Pickpocket (per model)",
+           x = "Risk Category") +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+#10. Conclusion: 1-2 paragraphs on why or why not you would recommend your algorithm be put into use by the local police to deter this activity.
+
+
+#References
+1. https://catalogofbias.org/biases/selection-bias/
+
+1. https://www.nature.com/articles/s41562-020-0858-1
+2. https://journals.sagepub.com/doi/full/10.1177/0963721418763931
+https://www.sciencedirect.com/science/article/pii/S0377221723009153

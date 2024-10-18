@@ -1,0 +1,1270 @@
+---
+title: "Housing Sale Price Predictive Model"
+author: "Ong Jia Yue and Sylvia Lam"
+date: "2024-10-11"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: flatly
+    toc_float: yes
+    code_folding: hide
+    number_sections: no
+  pdf_document:
+    toc: yes
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 Introduction
+
+This project's purpose was to factor in enough local intelligence to
+build a better predictive model of home prices in Philadelphia for
+Zillow. Better prediction of home prices will help the City of
+Philadelphia better assess property taxes. Predicting home prices is
+also useful to future homeowners in financial planning for home
+purchases and homesellers in listing their properties at a reasonable
+price.
+
+The challenge of this exercise was selecting variables we believed were
+relevant in predicting housing sale prices. Aside from interior
+characteristics, we gathered data from crime and transportation which
+were not always readily available in the desired format. We also had to
+account for missing values in our dataset.
+
+Our overall modeling strategy involved selecting independent variables
+within these three features: internal, external, and fixed spatial
+effects. The six independent variables selected were Total Livable Area,
+Vandalism/Criminal Mischief Crime (9 nearest neighbor), number of
+Southeastern Pennsylvania Transportation Authority (SEPTA) Stations
+within 1640 feet, number of fireplaces, exterior condition of house and
+ZIP Codes.
+
+We conducted an Ordinary-Least-Square (OLS) regression of Sale Price on
+these six variables. We then split the data randomly into a training and
+test set to test the model's accuracy and generalizability. The results
+suggest that our regression model is moderately accurate and does not
+generalize well.
+
+# 2 Data
+
+Data of sale prices and internal characteristics of the houses were
+taken from Philadelphia Properties and Assessment History from
+OpenDataPhilly. The data shows the property characteristics, ownership
+information, and most recent assessment of housing property. Data of
+2023 Vandalism/Criminal Mischief crimes and SEPTA Rail and Trolley
+stations were taken from OpenDataPhilly. We also added Parks and
+Recreation Trails data from OpenDataPhilly to explore whether it is a
+potential variable to include in our later regression modeling.
+
+## 2.1 Run packages needed
+
+We ran the relevant packages needed in subsequent analysis.
+
+```{r setup_packages, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(caret)
+library(ckanr)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(ggcorrplot)
+library(corrr)
+library(corrplot)# another way to plot correlation plot
+library(kableExtra)
+library(jtools)     # for regression model plots
+library(ggstance) # to support jtools plots
+library(ggpubr)    # plotting R^2 value on ggplot point scatter
+library(broom.mixed) # needed for effects plots
+library(rvest)
+library(tidycensus)
+library(mapview)
+library(ggplot2)
+library(pander)
+library(scales)
+
+# functions and data directory
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+palette5 <- c("#f0f9e8","#bae4bc","#7bccc4","#7DCFEC","#43a2ca")
+```
+
+```{r read_data_hidden, cache = TRUE, warning = FALSE, message = FALSE, include = FALSE}
+#Increasing the timeout time limit to load big datasets
+options(timeout = 200)
+
+#Loading crime data in the year 2023 from OpenDataPhilly (https://opendataphilly.org/datasets/crime-incidents/)
+crime_incidents2023 <- read.csv("https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272023-01-01%27%20AND%20dispatch_date_time%20%3C%20%272024-01-01%27")
+
+# SEPTA trolley stops data (https://opendataphilly.org/datasets/septa-routes-stops-locations/)
+SEPTA_trolleyStations2023 <- read.csv("https://opendata.arcgis.com/api/v3/datasets/dd2afb618d804100867dfe0669383159_0/downloads/data?format=csv&spatialRefId=4326")
+
+# Creating a sf object for trolley stations
+SEPTA_trolley.sf <- SEPTA_trolleyStations2023 %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4326, agr = "constant") 
+
+# SEPTA rail stops data
+SEPTA_highSpeedRailStations2023 <- read.csv("https://opendata.arcgis.com/api/v3/datasets/af52d74b872045d0abb4a6bbbb249453_0/downloads/data?format=csv&spatialRefId=4326")
+
+# Creating a sf object for high speed rail
+SEPTA_rail.sf <- SEPTA_highSpeedRailStations2023 %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, agr = "constant") 
+  
+
+# Parks and Recreation Trails data (https://opendataphilly.org/datasets/parks-and-recreation-ppr-trails/)
+PPRtrailsLocation <- st_read("https://opendata.arcgis.com/datasets/48323d574068405bbf5336b9b5b29455_0.geojson") 
+
+Parks <- PPRtrailsLocation %>%
+  select(c("TRAIL_NAME", "geometry")) %>% 
+  st_transform(crs = 4326)
+
+# Housing data
+housing_values <- st_read("studentData.geojson") %>%
+  mutate(fireplaces = ifelse(is.na(fireplaces), 0, fireplaces)) %>%
+  filter(!is.na(`exterior_condition`))
+
+# The data provided doesn't let me download so I just gonna leave this here for now (Sylvia)
+housing_values <- st_read("C:\\Users\\lamsy\\OneDrive - PennO365\\Desktop\\UPenn\\Fall_2024\\MUSA_5080\\Homework 3\\studentData.geojson") %>%
+  mutate(fireplaces = ifelse(is.na(fireplaces), 0, fireplaces)) %>%
+  filter(!is.na(`exterior_condition`))
+
+housing_values$census_tract<-as.character(housing_values$census_tract) #Convert census tract to character string
+housing_values$zip_code<-as.character(housing_values$zip_code) #Convert zipcode to character string
+
+#Recode exterior and interior condition
+housing_values <- housing_values %>%
+  mutate(exterior_condition = case_when(
+    exterior_condition == 0 ~ NA_character_,
+    exterior_condition == 1 ~ "NEWER CONSTRUCTION",
+    exterior_condition == 2 ~ "REHABILITATED",
+    exterior_condition == 3 ~ "ABOVE AVERAGE",
+    exterior_condition == 4 ~ "REHABILITATED",
+    exterior_condition == 5 ~ "AVERAGE",
+    exterior_condition == 6 ~ "BELOW AVERAGE",
+    exterior_condition == 7 ~ "VACANT",
+    exterior_condition == 8 ~ "SEALED",
+    exterior_condition == 9 ~ "STRUCTURALLY COMPROMISED, OPEN TO THE WEATHER"
+  ))
+housing_values <- housing_values %>%
+  mutate(interior_condition = case_when(
+    interior_condition == 0 ~ NA_character_,
+    interior_condition == 1 ~ "NEWER CONSTRUCTION",
+    interior_condition == 2 ~ "REHABILITATED",
+    interior_condition == 3 ~ "ABOVE AVERAGE",
+    interior_condition == 4 ~ "AVERAGE",
+    interior_condition == 5 ~ "BELOW AVERAGE",
+    interior_condition == 6 ~ "VACANT",
+    interior_condition == 7 ~ "SEALED/STRUCTURALLY COMPROMISED, OPEN TO THE WEATHER",
+  ))
+
+# Split between MODELLING and CHALLENGE
+housing_values_modelling<-subset(housing_values,toPredict == "MODELLING")
+housing_values_predict<-subset(housing_values,toPredict == "CHALLENGE")
+
+internal_characteristics <- housing_values_modelling %>%
+  select(c("objectid", "census_tract","zip_code","exterior_condition", "fireplaces", "garage_spaces", "interior_condition", "location", "number_of_bathrooms", "number_of_bedrooms", "number_stories", "off_street_open", "quality_grade", "parcel_number","sale_date","sale_price", "total_area", "total_livable_area", "year_built", "sale_year", "geometry"))
+
+# Creating a sf object for Philly
+philly.sf <- internal_characteristics %>% 
+  st_as_sf(crs = 4326, agr = "constant")
+
+#Census Tracts
+census_api_key("dea28a23f0b75d54e9eea0421b87003d3bd5c2d9", overwrite = TRUE)
+tracts22 <- 
+  get_acs(geography = "tract", 
+          variables = c("B01003_001E","B01001A_001E","B06011_001"), 
+          year = 2022, 
+          state=42, 
+          county=101, 
+          geometry=T, 
+          output = "wide") %>%
+  st_transform('EPSG:4326')  %>%
+  rename(TotalPop = B01003_001E,
+         NumberWhites = B01001A_001E,
+         Median_Income = B06011_001E) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority White", "Majority Non-White"),
+         incomeContext = ifelse(Median_Income > 35322, "High Income", "Low Income"))
+
+tracts22$census_tract<-as.character(as.numeric(str_sub(tracts22$GEOID,6,9))) #Convert census tract to character string
+
+zipcode<- st_read("https://opendata.arcgis.com/datasets/b54ec5210cee41c3a884c9086f7af1be_0.geojson")
+```
+
+## 2.2 Load data of Philadelphia
+
+We loaded a full set of internal characteristics data, 2023 crime data,
+SEPTA transit stations, and park trail data to be used for our analysis.
+
+```{r read_data, cache = TRUE, warning = FALSE, message = FALSE, eval = FALSE}
+#Increasing the timeout time limit to load big datasets
+options(timeout = 200)
+
+#Loading crime data in the year 2023 from OpenDataPhilly (https://opendataphilly.org/datasets/crime-incidents/)
+crime_incidents2023 <- read.csv("https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272023-01-01%27%20AND%20dispatch_date_time%20%3C%20%272024-01-01%27")
+
+# SEPTA trolley stops data (https://opendataphilly.org/datasets/septa-routes-stops-locations/)
+SEPTA_trolleyStations2023 <- read.csv("https://opendata.arcgis.com/api/v3/datasets/dd2afb618d804100867dfe0669383159_0/downloads/data?format=csv&spatialRefId=4326")
+
+# Creating a sf object for trolley stations
+SEPTA_trolley.sf <- SEPTA_trolleyStations2023 %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4326, agr = "constant") 
+
+# SEPTA rail stops data
+SEPTA_highSpeedRailStations2023 <- read.csv("https://opendata.arcgis.com/api/v3/datasets/af52d74b872045d0abb4a6bbbb249453_0/downloads/data?format=csv&spatialRefId=4326")
+
+# Creating a sf object for high speed rail
+SEPTA_rail.sf <- SEPTA_highSpeedRailStations2023 %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, agr = "constant") 
+  
+
+# Parks and Recreation Trails data (https://opendataphilly.org/datasets/parks-and-recreation-ppr-trails/)
+PPRtrailsLocation <- st_read("https://opendata.arcgis.com/datasets/48323d574068405bbf5336b9b5b29455_0.geojson") 
+
+Parks <- PPRtrailsLocation %>%
+  select(c("TRAIL_NAME", "geometry")) %>% 
+  st_transform(crs = 4326)
+
+# Housing data
+housing_values <- st_read("studentData.geojson") %>%
+  mutate(fireplaces = ifelse(is.na(fireplaces), 0, fireplaces)) %>%
+  filter(!is.na(`exterior_condition`))
+
+housing_values$census_tract<-as.character(housing_values$census_tract) #Convert census tract to character string
+housing_values$zip_code<-as.character(housing_values$zip_code) #Convert zipcode to character string
+
+#Recode exterior and interior condition
+housing_values <- housing_values %>%
+  mutate(exterior_condition = case_when(
+    exterior_condition == 0 ~ NA_character_,
+    exterior_condition == 1 ~ "NEWER CONSTRUCTION",
+    exterior_condition == 2 ~ "REHABILITATED",
+    exterior_condition == 3 ~ "ABOVE AVERAGE",
+    exterior_condition == 4 ~ "REHABILITATED",
+    exterior_condition == 5 ~ "AVERAGE",
+    exterior_condition == 6 ~ "BELOW AVERAGE",
+    exterior_condition == 7 ~ "VACANT",
+    exterior_condition == 8 ~ "SEALED",
+    exterior_condition == 9 ~ "STRUCTURALLY COMPROMISED, OPEN TO THE WEATHER"
+  ))
+housing_values <- housing_values %>%
+  mutate(interior_condition = case_when(
+    interior_condition == 0 ~ NA_character_,
+    interior_condition == 1 ~ "NEWER CONSTRUCTION",
+    interior_condition == 2 ~ "REHABILITATED",
+    interior_condition == 3 ~ "ABOVE AVERAGE",
+    interior_condition == 4 ~ "AVERAGE",
+    interior_condition == 5 ~ "BELOW AVERAGE",
+    interior_condition == 6 ~ "VACANT",
+    interior_condition == 7 ~ "SEALED/STRUCTURALLY COMPROMISED, OPEN TO THE WEATHER",
+  ))
+
+# Split between MODELLING and CHALLENGE
+housing_values_modelling<-subset(housing_values,toPredict == "MODELLING")
+housing_values_predict<-subset(housing_values,toPredict == "CHALLENGE")
+
+internal_characteristics <- housing_values_modelling %>%
+  select(c("objectid", "census_tract","zip_code","exterior_condition", "fireplaces", "garage_spaces", "interior_condition", "location", "number_of_bathrooms", "number_of_bedrooms", "number_stories", "off_street_open", "quality_grade", "parcel_number","sale_date","sale_price", "total_area", "total_livable_area", "year_built", "sale_year", "geometry"))
+
+# Creating a sf object for Philly
+philly.sf <- internal_characteristics %>% 
+  st_as_sf(crs = 4326, agr = "constant")
+
+#Census Tracts
+census_api_key("dea28a23f0b75d54e9eea0421b87003d3bd5c2d9", overwrite = TRUE)
+tracts22 <- 
+  get_acs(geography = "tract", 
+          variables = c("B01003_001E","B01001A_001E","B06011_001"), 
+          year = 2022, 
+          state=42, 
+          county=101, 
+          geometry=T, 
+          output = "wide") %>%
+  st_transform('EPSG:4326')  %>%
+  rename(TotalPop = B01003_001E,
+         NumberWhites = B01001A_001E,
+         Median_Income = B06011_001E) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority White", "Majority Non-White"),
+         incomeContext = ifelse(Median_Income > 35322, "High Income", "Low Income"))
+
+tracts22$census_tract<-as.character(as.numeric(str_sub(tracts22$GEOID,6,9))) #Convert census tract to character string
+
+zipcode<- st_read("https://opendata.arcgis.com/datasets/b54ec5210cee41c3a884c9086f7af1be_0.geojson")
+```
+
+## 2.3 Crime Data Wrangling
+
+To determine the spatial effects of lower crime rates and safety on
+housing prices, we looked at the top 10 crimes in Philadelphia and
+decided that Vandalism/Criminal Mischief would be a relevant crime
+predictor to include in our model. Houses in areas that have lower rates
+of vandalism and petty crimes could fetch higher sale prices as the
+surrounding area would be safer.
+
+We determined that the spatial effect of safety on housing prices would
+be examined within a 660 feet buffer zone and using k-nearest neighbors
+(knn). knn was used to suggest that areas where incidents of
+vandalism/criminal mischief occur closer to each other are "more
+exposed" to vandalism/criminal mischief than areas where such incidents
+occur further apart. We chose 8 to 10 as we expect the impact of
+Vandalism/Criminal Mischief to be felt at a high frequency.
+
+```{r crime_buffer, warning = FALSE, message = FALSE, cache = TRUE}
+
+# Looking at the top 10 types of crimes in Philadelphia
+crime_incidents2023 %>% 
+  group_by(text_general_code) %>%
+  summarize(count = n()) %>%
+  arrange(-count) %>% 
+  top_n(10) %>%
+  kable(col.names = c("Type of Crime", "Count"), caption = "Table 1: Top 10 Crimes in Philadelphia") %>%
+  kable_styling()
+
+# Cleaning up the crime data and choosing Vandalism/Criminal Mischief as an important crime predictor variable
+
+phillyCrimes.sf <-
+  crime_incidents2023 %>%
+    filter(text_general_code == "Vandalism/Criminal Mischief",
+           lat > -1) %>%
+    dplyr::select(lat, lng) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("lng", "lat"), crs = 4326) %>%
+    distinct()
+
+# Counts of crime per buffer of house sale
+philly.sf$crimes.Buffer <- philly.sf %>% 
+    st_buffer(660) %>% 
+    aggregate(mutate(phillyCrimes.sf, counter = 1),., sum) %>%
+    pull(counter)
+
+# k nearest neighbor for crimes
+
+philly.sf <- philly.sf %>% 
+  mutate(
+    crime_nn8 = nn_function(st_coordinates(philly.sf),
+                            st_coordinates(phillyCrimes.sf), k = 8),
+    crime_nn9 = nn_function(st_coordinates(philly.sf),
+                            st_coordinates(phillyCrimes.sf), k = 9),
+    crime_nn10 = nn_function(st_coordinates(philly.sf),
+                             st_coordinates(phillyCrimes.sf), k = 10))
+```
+
+## 2.4 SEPTA Buffer
+
+To determine the effects of transportation access on housing prices, we
+included SEPTA rail and trolley stops and determined that houses within
+a 1640 feet (500 meter) buffer could fetch higher prices due to it being
+in a location of increased transportation accessibility.
+
+```{r SEPTA_buffer, warning = FALSE, message = FALSE}
+SEPTARail.pt<-select(SEPTA_rail.sf,geometry)
+SEPTATrolley.pt<-select(SEPTA_trolley.sf,geometry)
+
+philly.sf$SEPTARail.Buffer <- philly.sf %>% 
+    st_buffer(1640) %>% 
+    aggregate(mutate(SEPTARail.pt, counter = 1),., sum) %>%
+    pull(counter)
+
+philly.sf$SEPTATrolley.Buffer <- philly.sf %>% 
+    st_buffer(1640) %>% 
+    aggregate(mutate(SEPTATrolley.pt, counter = 1),., sum) %>%
+    pull(counter)
+
+# Change NA values to 0
+philly.sf <- philly.sf %>% 
+  mutate(SEPTARail.Buffer = ifelse(is.na(SEPTARail.Buffer), 0, SEPTARail.Buffer),SEPTATrolley.Buffer = ifelse(is.na(SEPTATrolley.Buffer), 0, SEPTATrolley.Buffer)) %>%
+  mutate(SEPTA.Buffer = SEPTARail.Buffer + SEPTATrolley.Buffer)
+
+```
+
+## 2.5 Park Buffer
+
+To determine the spatial effects of parks on housing prices, we decided
+that living within a 660 feet buffer from parks is a reasonable distance
+that could potentially increase housing prices.
+
+```{r park_buffer, warning = FALSE, message = FALSE}
+Parks.pt <- select(Parks, geometry)
+
+philly.sf$Park.Buffer <- philly.sf %>%
+  st_buffer(660) %>%
+  aggregate(mutate(Parks.pt, counter = 1),., sum) %>%
+  pull(counter)
+
+philly.sf <- philly.sf %>% mutate(Park.Buffer = ifelse(is.na(Park.Buffer), 0, Park.Buffer))
+
+```
+
+## 2.6 Summary statistics of variables
+
+We sorted our variables based on the three different categories:
+Internal Characteristics, Amenities/Public Services, and Spatial
+Structure. We split up the tables into numeric variables (Table 2),
+categorical variable of Zip Code which is a spatial structure (Table 3),
+and categorical variable of exterior condition which is an internal
+characteristic (Table 4) .
+
+```{r Summary Statistics Table, warning = FALSE, message = FALSE}
+#Summary Table of Numeric (Total Livable Area, Fireplace, Crime_nn9, SEPTA)
+summary_stats_numeric <- data.frame(
+  Statistic = c("Fireplaces",
+                "Total Livable Area",
+                "Crime 9 nearest neighbor",
+                "SEPTA Buffer"),
+  Mean = round(
+    c(mean(philly.sf$fireplaces,na.rm = TRUE),
+           mean(philly.sf$total_livable_area),
+           mean(philly.sf$crime_nn9),
+           mean(philly.sf$SEPTA.Buffer))
+    ,3),
+  StandardDeviation = round(
+    c(sd(philly.sf$fireplaces,na.rm = TRUE),
+                        sd(philly.sf$total_livable_area),
+                        sd(philly.sf$crime_nn9),
+                        sd(philly.sf$SEPTA.Buffer))
+    ,3)
+  )
+    
+variable_descriptions <- data.frame(
+  Description = c("Number of Fireplaces",
+                  "Size of Livable Area in feet",
+                  "Number of Crime in area (calculated with 9 nearest neighbor)",
+                  "Number of SEPTA stops with 1640 ft"
+                  ),
+  Category = c("Internal Characteristics",
+               "Internal Characteristics",
+               "Amenities/Public Services",
+               "Amenities/Public Services"
+               )
+)
+
+
+summary.table<-cbind(summary_stats_numeric,variable_descriptions)
+summary.table %>%
+  kable(caption = "Table 2: Summary Statistics for Numerical Variables") %>%
+  kable_minimal()
+
+#Summary Table of Categorical (Exterior Condition, Zipcode)
+a1<-data.frame(table(philly.sf$exterior_condition))
+a2<-data.frame(table(philly.sf$zip_code))
+
+a2 %>%
+  kable(caption = "Table 3: Summary Statistics for Categorical Variable Zip Code - Spatial Feature<br><small>Nine-digit field which identifies the full zip code</small>", col.names = c("Zip Code", "Count")) %>%
+  kable_minimal()
+
+a1 %>%
+  kable(caption = "Table 4: Summary Statistics for Categorical Variable Exterior Condition - Internal Characteristic<br><small>Relates to how the exterior appears based on observation.", col.names = c("Exterior Condition", "Count")) %>%
+  kable_minimal()
+```
+
+## 2.7 Correlation matrix
+
+From the correlation matrix, we selected variables that showed a higher
+correlation to housing sale prices for our model. The internal
+characteristics we selected were exterior condition, total livable area
+and number of fireplaces. The amenities/public services we chose were
+9-nearest neighbors of crime (Crime_nn9) and SEPTA buffer. The spatial
+fixed effects is Zip Code.
+
+```{r correlation matrix, warning = FALSE, message = FALSE}
+numericVars <- 
+  select_if(st_drop_geometry(philly.sf), is.numeric) %>% na.omit()
+
+color_palette <- colorRampPalette(c("#CF5116", "white", "#41779C"))(200)
+
+cor_matrix <- round(cor(numericVars),1)
+
+corrplot(cor_matrix, method = "color",  
+         type = "upper", 
+         order = "hclust", 
+         tl.col = "black",      
+         tl.srt = 45,
+         tl.cex = 0.8,
+         diag = FALSE,         
+         col = color_palette,
+         title = "Figure 1: Correlation Matrix", 
+         mar = c(0, 0, 1, 0),
+         )
+```
+
+## 2.8 Correlation scatterplots
+
+Having housing sale prices of more than \$1,000,000 was determined as
+outliers. To cater to the general population, we decided only to include
+houses that are below \$1,000,000 sale price. This will increase
+generalizability and produce more accurate predictions for houses below
+\$1,000,000 price value.
+
+Our decision is based on the median house price of Philadelphia, which
+is \~\$275,000. We took \$1,000,000 as the upper limit to account for
+houses that might have been sold at higher prices.
+
+```{r correlation scatterplots, warning = FALSE, message = FALSE}
+
+philly_sub_1mil <- st_drop_geometry(philly.sf) %>% 
+  filter(sale_price <= 1000000) 
+
+
+#Scatter Plot 1: Total Liveable Area
+
+ggscatter(philly_sub_1mil,
+          x = "total_livable_area",
+          y = "sale_price",
+          add = "reg.line",
+          color = "black",
+          size = 2,
+          shape = 21,
+          fill = "lightblue",
+          alpha = 0.7) +
+  stat_cor(label.x = 2500, label.y = 1500000, size = 5, color = "black") +
+  labs(title = "Figure 2: Relationship betweeen Total Livable Area and Sale Price",
+       x = "Total Livable Area (sq ft)",
+       y = "Sale Price ($)") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+#Scatter Plot 2: SEPTA Buffer
+ggscatter(philly_sub_1mil,
+          x = "SEPTA.Buffer",
+          y = "sale_price",
+          add = "reg.line",
+          color = "black",
+          size = 2,
+          shape = 21,
+          fill = "lightblue",
+          alpha = 0.7) +
+  stat_cor(label.x = 12, label.y = 0, size = 5, color = "black") +
+  labs(title = "Figure 3: Relationship betweeen Number of SEPTA stations and Sale Price",
+       x = "Number of SEPTA stations (wihtin 1640 feet)",
+       y = "Sale Price ($)") +
+  theme_minimal() +
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5))
+
+#Scatter Plot 3: Crime
+philly_sub_1mil %>%
+  st_drop_geometry() %>%
+  dplyr::select(sale_price, crime_nn9) %>%
+  filter(sale_price <= 1000000) %>%
+  gather(Variable, Value, -sale_price) %>% 
+  ggplot(aes(Value, sale_price)) +
+  geom_point(size = 2, shape = 21, fill = "lightblue", color = "black") + 
+  geom_smooth(method = "lm", se=F, colour = "black") +
+  facet_wrap(~Variable, nrow = 1, scales = "free") +
+  labs(title = "Figure 4: Price as a function of crime (9-nearest neighbour)",
+        x = "Crime (9 nearest neighbor)", 
+        y = "Sale Price ($)") +
+  theme_minimal() +
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5))
+
+# # Scatter Plot 4: Fireplaces 
+ggscatter(philly_sub_1mil,
+          x = "fireplaces",
+          y = "sale_price",
+          add = "reg.line",
+          color = "black",
+          size = 2,
+          shape = 21,
+          fill = "lightblue",
+          alpha = 0.7) +
+  stat_cor(label.x = 2, label.y = 0, size = 5, color = "black") +
+  labs(title = "Figure 5: Relationship betweeen Number of fireplaces and Sale Price",
+       x = "Number of fireplaces",
+       y = "Sale Price ($)") +
+  theme_minimal() +
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+## 2.9 Map of dependent variable (sale price)
+
+We created a map of housing sale prices across Philadelphia and we
+observe clustering of homes. Houses with higher sale prices appear
+clustered in the northeast and northwest of Philadelphia while houses
+with lower sale prices appear clustered in the center of Philadelphia.
+
+```{r map of dependent variable, warning = FALSE, message = FALSE}
+# Mapping data
+ggplot() +
+  geom_sf(data = zipcode, fill = "grey30") +
+  geom_sf(data = philly.sf, aes(colour = q5(sale_price)), #to be updated
+          show.legend = "point", size = 3,alpha=1) +
+  scale_colour_manual(values = palette5,
+                   labels=qBr(philly.sf,"sale_price"),
+                   name="Quintile\nBreaks") +
+  labs(title="Figure 6: Sale Price of Housing, Philadelphia") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+## 2.10 Maps of independent variables
+
+We created 3 maps showing the spatial distribution of vandalism/criminal
+mischief, SEPTA Buffer and total livable area.
+
+Firstly, the crime independent variable using vandalism and criminal
+mischief was plotted as a density graph to highlight the areas where
+this crime occurs at a higher frequency. We observe high clustering in
+some areas and little to no Vandalism/Criminal Mischief in certain zip
+code areas. We acknowledge that there is the potential of bias in our
+crime data that could potentially arise due to inconsistent reporting of
+crimes in different areas.
+
+Secondly, the SEPTA trolley buffer map highlights the areas nearer to
+stations and we observe that these effects are seen mainly along the
+train lines. There are many zip codes that do not enjoy the benefits of
+living nearer to transit stations and in a car-lite society, we
+acknowledge that this variable may not be as correlated to housing sale
+prices.
+
+Lastly, majority of the total livable area is randomly distributed
+spatially, but we observe a slight clustering pattern where houses with
+lower total livable area are found mostly in the center of Philadelphia
+and houses with higher total livable areas are found in the northeast
+and northwest areas of Philadelphia.
+
+Comparing the maps, we observe that the center of Philadelphia
+experiences higher density of vandalism/criminal mischief cases, with
+more accessibility to transit stations, and a smaller total livable
+area. The converse relationship between these 3 variables are also
+observed.
+
+```{r 3 maps of independent variables, warning = FALSE, message = FALSE}
+#Replace NA value as 0 in total_livable_area
+philly.sf <- philly.sf %>% mutate(total_livable_area = ifelse(is.na(total_livable_area), 0, total_livable_area))
+
+# Independent Variable 1: Crime
+ggplot() + 
+  geom_sf(data = zipcode, fill = "lightgrey") +
+  stat_density2d(data = data.frame(st_coordinates(phillyCrimes.sf)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Density") +
+  scale_alpha(range = c(0.00, 0.35), guide = "none") +
+  labs(title = "Figure 7: Density Vandalism/Criminal Mischief, Philadelphia") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Independent Variable 2: SEPTA Trolley
+ggplot() +
+  geom_sf(data = zipcode, fill = "lightgrey") +
+  geom_sf(data = philly.sf, aes(colour = SEPTA.Buffer), 
+          show.legend = "point", size = 2) +
+  labs(title="Figure 8: SEPTA transport stations within 1640 ft, Philadelphia") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Independent Variable 3: Total Livable Area
+ggplot() +
+  geom_sf(data = zipcode, fill = "grey30") +
+  geom_sf(data = philly.sf, aes(colour = q5(total_livable_area)),
+          show.legend = "point", size = 3,alpha=1) +
+  scale_colour_manual(values = palette5,
+                   labels=qBr(philly.sf,"total_livable_area"),
+                   name="Quintile\nBreaks") +
+  labs(title="Figure 9: Total Livable Area, Philadelphia") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+## 2.11 Categorical variable: exterior condition
+
+Additionally, we created a graph of sale prices as a function of
+exterior condition to show price variations across different categories
+of exterior condition. As expected, houses with newer construction or
+above average exterior conditions fetch a higher mean sale price as
+compared to those that are average, below average, or vacant.
+
+```{r maps/graphs/charts, warning = FALSE, message = FALSE}
+#Price as a function of exterior condition
+ philly.sf %>%
+  filter(!is.na(exterior_condition)) %>%
+  ggplot(aes(exterior_condition, sale_price)) +
+  geom_bar(position = "dodge", stat = "summary", fun = "mean", fill = "#4D90BE") +
+  labs(title = "Figure 10: Price as a function of exterior condition", y = "Mean Price", x = "Exterior Condition") +
+  scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+```
+
+# 3 Methods
+
+We modeled the relationship between sale prices and the following
+independent variables: zip codes, total livable area, exterior
+condition, number of fireplaces, crime (9-nearest neighbor) and number
+of SEPTA Stations within 1640 feet. We used a statistical method called
+OLS Regression to find the effects of each independent variable on sale
+prices.
+
+For OLS Regression, we split our data into two sets: training and test.
+OLS Regression was first done on the training set to create our model.
+We then run our model on the test data set to predict values of housing
+sale prices.
+
+The model is then checked for accuracy and generalizability using Mean
+Absolute Error and Cross Validation respectively. We also check for
+spatial autocorrelation and clustering/dispersion using Spatial Lags and
+Moran's I respectively. The results are discussed further in the results
+sections.
+
+# 4 Results
+
+## 4.1 Creating training and test set
+
+We randomly divided the whole dataset into training and test sets while
+ensuring that each unique zip code was included in the training set.
+This method guarantees that no zip code is left out, enabling our model
+to account for spatial fixed effects and be more effectively applied to
+the test set.
+
+```{r split training and test set, warning = FALSE, message = FALSE}
+# Splitting up the data equally using zipcode as the variable and creating a 50-50 split for training and test set
+inTrain <- createDataPartition(
+              y = paste(philly.sf$zip_code), 
+              p = .50, list = FALSE)
+
+
+philly.training <- philly.sf[inTrain,] 
+philly.test <- philly.sf[-inTrain,]
+```
+
+## 4.2 Linear Model training set summary results
+
+The training set was used to create our regression model. Our model
+suggests that:
+
+1.  On average, a one square foot increase in total livable area is
+    associated with a \$203.71 increase in sale price.
+2.  On average, a one unit increase in fire places is associated with a
+    \$64263.60 increase in sale price.
+3.  On average, a one unit increase in SEPTA Buffer is associated with a
+    \$11691.92 increase in sale price.
+4.  On average, a one unit increase in crime 9-nearest neighbor is
+    associated with a \$14436113.61 increase in sale price.
+
+For categorical variables:
+
+5\. The reference Zip Code is 19102. The estimates show the predicted
+difference in sale price across Zip Code. For example, on average,
+houses in Zip Code 19103 are expected to be \$64986.57 higher than
+houses in 19102.
+
+6\. The reference exterior condition is Above Average. The estimates
+show the predicted difference in sale price across exterior condition.
+For example, on average, houses with average exterior condition are
+expected to be \$95787.01 lower than houses with above average exterior
+condition.
+
+```{r regression model training set, warning = FALSE, message = FALSE}
+reg.training <- 
+  lm(sale_price ~ ., data = as.data.frame(philly.training) %>% 
+                             dplyr::select(sale_price,
+                                           total_livable_area,
+                                           exterior_condition,
+                                           fireplaces,
+                                           crime_nn9, 
+                                           SEPTA.Buffer,
+                                           zip_code))
+model_summary <- summary(reg.training)
+
+coefficients <- as.data.frame(model_summary$coefficients)
+r_squared <- model_summary$r.squared
+
+summary_table <- coefficients %>%
+  rownames_to_column(var = "Predictor") %>%
+  select(Predictor, Estimate = Estimate, p_value = `Pr(>|t|)`) %>%
+  slice(-1) %>%
+  mutate(p_value = format(p_value, scientific = TRUE, digits = 2))
+
+r_squared_row <- data.frame(Predictor = "R-squared", Estimate = r_squared)
+
+summary_table <- bind_rows(summary_table, r_squared_row)
+
+kable(summary_table, digits = 3, caption = "Table 5: Summary Statistics for Linear Model") %>%
+  kable_minimal()
+```
+
+## 4.3 Mean absolute error and Mean Absolute Percentage Error for Neighborhood Regression
+
+We then applied our model to the test set to assess whether it is a good
+model. The assessment criteria are accuracy and generalizability.
+
+Accuracy refers to how different our predicted sale prices is from the
+actual sale prices. The average of these differences is the Mean
+Absolute Error (MAE). The average of these differences in percentage
+terms is Mean Absolute Percentage Error (MAPE). A higher MAE and MAPE
+imply lower accuracy.
+
+The MAE and MAPE of our model is \$75,109.91 and 0.47 respectively. This
+suggests that our model has moderate accuracy.
+
+```{r table, message = FALSE, warning= FALSE}
+philly.test.nhood <-
+  philly.test %>%
+  mutate(Regression = "Neighborhood Regression",
+         SalePrice.Predict = predict(reg.training, philly.test),
+         SalePrice.Error = SalePrice.Predict - sale_price,
+         SalePrice.AbsError = abs(SalePrice.Predict - sale_price),
+         SalePrice.APE = (abs(SalePrice.Predict - sale_price)) / sale_price) %>%
+  filter(sale_price < 1000000) 
+
+philly.test.nhood %>%
+  st_drop_geometry() %>%
+  summarize(Regression = "Neighborhood Regression", MAE = mean(SalePrice.AbsError, na.rm= T), MAPE = mean(SalePrice.APE, na.rm= T)) %>%
+  kable(caption = "Table 6: MAE and MAPE of Neighborhood Regression") %>%
+  kable_minimal()
+```
+
+## 4.4 Cross-validation
+
+Generalizability refers to how accurate our model predict the sale
+prices of new houses (goodness of fit). We use a method called "k-fold"
+cross-validation to check for goodness of fit.
+
+K-fold cross-validation involves randomly dividing the whole dataset
+into ( k ) approximately equal-sized folds. Each fold is used once as a
+validation set while the model is trained on the remaining ( k-1 )
+folds. The Mean Squared Error (MSE) is computed for each validation
+fold, and this process is repeated ( k ) times, resulting in ( k ) MSE
+estimates. The k-fold MSE estimate is the average of these MSEs, and the
+k-fold Root Mean Squared Error (RMSE) is the square root of this average
+MSE.
+
+```{r cv, warning = FALSE, message = FALSE}
+fitControl <- trainControl(method = "cv", number = 100)
+set.seed(825)
+
+reg.cv <- 
+  train(sale_price ~ ., data = st_drop_geometry(philly.sf) %>% 
+                                dplyr::select(sale_price,
+                                           total_livable_area,
+                                           exterior_condition,
+                                           fireplaces,
+                                           crime_nn9, 
+                                           SEPTA.Buffer,
+                                           zip_code), 
+     method = "lm", trControl = fitControl, na.action = na.pass)
+
+cv <- reg.cv$resample[1:100,] 
+
+#Provide results of cv
+cv %>%
+  select(Resample, MAE, RMSE, Rsquared) %>%
+  kable(digits = 3, caption = "Table 7: Cross-Validation MAE Summary") %>%
+  row_spec(0, color = "black") %>%
+  kable_minimal()
+  
+cv %>%  
+  summarise(
+    mean_MAE = mean(MAE),
+    sd_MAE = sd(MAE),
+  ) %>%
+  mutate(Statistic = "MAE") %>%
+  select(Statistic, mean_MAE, sd_MAE) %>%
+  kable(digits = 3, caption = "Table 8: Mean and sd MAE Summary") %>%
+  kable_minimal()
+
+#Histogram of cv MAE
+ggplot(cv, aes(x = MAE)) +
+  geom_histogram(binwidth = 2000, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Figure 11: Histogram of MAE", x = "Mean Absolute Error", y = "Frequency") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  theme_minimal()
+```
+
+Our model is tested for generalizability based on its goodness of fit
+which is reflected in the standard deviation of the MAE of the
+cross-validation model. The standard deviation of MAE across all 100
+folds is \$7,003 which suggests that there is a decent range of variance
+in our MAE after considering spatial effects. When looking at the
+histogram, the MAE shows a clustered distribution about the mean MAE of
+\$81,691. The range of errors suggests that the model has some
+inconsistencies in its predictions and would likely be unreliable for
+predicting the house prices of those that were not recently sold. Our
+model therefore does not generalize well.
+
+## 4.5 Predicted prices and observed prices
+
+Our prediction line intersects the perfect prediction line around the
+value of \$250,000 which indicates that our model is able to predict
+sale price that are closer to the actual sale price when it is around
+\$250,000. Our model is then less able to predict higher and lower
+prices as seen from the deviation between our prediction line and the
+perfect prediction line.
+
+```{r predPrice_obsPrice, warning = FALSE, message=  FALSE}
+#Mapping
+philly.test.nhood %>%
+  dplyr::select(SalePrice.Predict, sale_price, Regression) %>%
+    ggplot(aes(sale_price, SalePrice.Predict)) +
+  geom_point() +
+  stat_smooth(aes(sale_price, sale_price), 
+             method = "lm", se = FALSE, size = 1, colour="lightgreen") + 
+  stat_smooth(aes(SalePrice.Predict, sale_price), 
+              method = "lm", se = FALSE, size = 1, colour="red") +
+  facet_wrap(~Regression) +
+  labs(title = "Figure 12: Predicted sale price as a function of observed price",
+       subtitle = "Green line represents a perfect prediction; Red line represents prediction",
+       x = "Sale Price",
+       y = "Predicted Sale Price") +
+  scale_x_continuous(labels = label_number(accuracy = 1)) + 
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  theme_minimal()
+```
+
+## 4.6 Residuals, Moran's I test and Spatial Lag in errors
+
+As we are modelling geographic data, we also test for spatial
+autocorrelation and clustering/dispersion of sales price using Spatial
+Lags and Moran's I respectively. Spatial Lags calculates the average
+sale price of a home sale's 5 nearest neighbors. Moran's I test whether
+there is no spatial autocorrelation and where a random distribution will
+occur for values nearer to 0. A more negative Moran's I indicates a more
+dispersed spatial pattern and a more positive Moran's I indicates more
+clustering.
+
+```{r spatial_lag, warning = FALSE, message = FALSE}
+#Residual Map
+ggplot() +
+  geom_sf(data = zipcode, fill = "lightgrey") +
+  geom_sf(data = philly.test.nhood, aes(colour = SalePrice.Error), 
+          show.legend = "point", size = 2) +
+  labs(title="Figure 13: Residual Map",
+       color = "Sale Price Error") +
+  scale_color_continuous(labels = label_number(accuracy = 1)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Spatial Lags
+coords <- st_coordinates(philly.sf) 
+
+neighborList <- knn2nb(knearneigh(coords, 5))
+
+spatialWeights <- nb2listw(neighborList, style="W")
+
+philly.sf$lagPrice <- lag.listw(spatialWeights, philly.sf$sale_price)
+
+#Remove the NA in SalePrice.Error column
+philly.test.nhood <- philly.test.nhood %>%
+  filter(is.finite(SalePrice.Error)) 
+
+coords.test <-  st_coordinates(philly.test.nhood) 
+
+neighborList.test <- knn2nb(knearneigh(coords.test, 5))
+
+spatialWeights.test <- nb2listw(neighborList.test, style="W")
+ 
+philly.test.nhood %>% 
+  mutate(lagPriceError = lag.listw(spatialWeights.test, SalePrice.Error)) %>%
+  ggplot(aes(x =lagPriceError, y =SalePrice.Error))+
+  geom_point(color = "lightblue", alpha = 0.7) +
+  labs(title = "Figure 14: Spatial Lag of Sale Price Error",
+       x = "Lag of Sale Price Error",
+       y = "Sale Price Error") +
+  geom_smooth(method = "lm", color = "blue") +
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  theme_minimal()
+
+#Moran's I (double check)
+moranTest <- moran.mc(philly.test.nhood$SalePrice.Error, 
+                      spatialWeights.test, nsim = 999)
+
+ggplot(as.data.frame(moranTest$res[c(1:999)]), aes(moranTest$res[c(1:999)])) +
+  geom_histogram(binwidth = 0.01) +
+  geom_vline(aes(xintercept = moranTest$statistic), colour = "blue",size=2) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  labs(title="Figure 15: Observed and permuted Moran's I",
+       subtitle= "Observed Moran's I in blue",
+       x="Moran's I",
+       y="Count") +
+  theme_minimal()
+```
+
+The observed Moran's I is a positive value near 0.3, indicating a low
+positive spatial autocorrelation where some clustering occurs.
+
+## 4.7 Map of predicted values
+
+Our predicted sale price values follow a clustering pattern with higher
+values in the northeast and northwest of Philadelphia and lower sale
+prices in the center of Philadelphia.
+
+```{r pred_values, message = FALSE, warning = FALSE}
+philly.toPredict <- housing_values %>%
+  select(c("objectid","census_tract",
+           "zip_code","exterior_condition",
+           "sale_price", "total_livable_area",
+           "fireplaces","sale_year",
+           "geometry"))
+
+philly.toPredict$crimes.Buffer <- philly.toPredict %>% 
+    st_buffer(660) %>% 
+    aggregate(mutate(phillyCrimes.sf, counter = 1),., sum) %>%
+    pull(counter)
+
+philly.toPredict <- philly.toPredict %>% 
+  mutate(
+    crime_nn8 = nn_function(st_coordinates(philly.toPredict),
+                            st_coordinates(phillyCrimes.sf), k = 8),
+    crime_nn9 = nn_function(st_coordinates(philly.toPredict),
+                            st_coordinates(phillyCrimes.sf), k = 9),
+    crime_nn10 = nn_function(st_coordinates(philly.toPredict),
+                             st_coordinates(phillyCrimes.sf), k = 10))
+
+#Run SEPTA buffers
+SEPTA.pt<-rbind(SEPTARail.pt,SEPTATrolley.pt)
+
+philly.toPredict$SEPTA.Buffer <- philly.toPredict %>% 
+    st_buffer(1640) %>% 
+    aggregate(mutate(SEPTA.pt, counter = 1),., sum) %>%
+    pull(counter)
+
+philly.toPredict <- philly.toPredict %>%
+  mutate(SEPTA.Buffer = ifelse(is.na(SEPTA.Buffer), 0, SEPTA.Buffer))
+
+philly.toPredict <- philly.toPredict %>%
+  mutate(Regression = "Prediction Regression",
+         SalePrice.Predict = predict(reg.training, philly.toPredict))
+
+ggplot() +
+  geom_sf(data = zipcode, fill = "grey40") +
+  geom_sf(data = philly.toPredict, aes(colour = q5(SalePrice.Predict)), 
+          show.legend = "point", size = 3, alpha = 0.7) +
+  scale_colour_manual(values = palette5,
+                   labels=qBr(philly.toPredict,"SalePrice.Predict"),
+                   name="Quintile Breaks") +
+  labs(title="Figure 16: Predicted Sale Price of Housing, Philadelphia") +
+  theme_void()
+
+```
+
+## 4.8 Map of MAPE by neighborhood
+
+The neighborhood scale of analysis taken here is by zip code areas to
+ensure that we are not overfitting or underfititng the spatial effects
+of our model. Zip code areas are delineated around a single post office
+and the extent of their delivery route. A census block will be assigned
+a zip code number based on the post office that the majority of the
+addresses within a census block uses.
+
+```{r MAPE_neighborhood, warning = FALSE, message = FALSE}
+#Mapping
+st_drop_geometry(philly.test.nhood) %>%
+  group_by(zip_code) %>%
+  summarize(mean.MAPE = mean(SalePrice.APE, na.rm = T)) %>%
+  ungroup() %>% 
+  left_join(zipcode, by = c("zip_code" = "CODE")) %>%
+    st_sf() %>%
+    ggplot() + 
+      geom_sf(data = zipcode, fill = "lightgrey")+
+      geom_sf(aes(fill = 100*mean.MAPE), color = "black") +
+      geom_sf(data = philly.test.nhood, colour = "gray30", size = .5) +
+      facet_wrap(~Regression) +
+      scale_fill_gradient(low = palette5[1], high = palette5[5],
+                          name = "MAPE") +
+      labs(title = "Figure 17: Mean test set MAPE by neighborhood ZIP Code") +
+      theme_void()
+```
+
+## 4.9 MAPE and mean price by neighborhood
+
+We observe that data points with extremely low or high sale price values
+tend to fall above the blue line, indicating that it has a higher MAPE
+value which corresponds to lower accuracy.
+
+```{r MAPE_meanPrice, warning = FALSE, message = FALSE}
+st_drop_geometry(philly.test.nhood) %>%
+  group_by(zip_code) %>%
+  summarize(mean.MAPE = mean(SalePrice.APE, na.rm = T),mean.Price = mean(sale_price, na.rm = T)) %>%
+   ggplot(aes(x=mean.Price, y=mean.MAPE)) +
+     geom_point(size = 2) + geom_smooth(method = "lm", se=F, colour = "blue") +
+     labs(title = "Figure 18: MAPE as a function of mean price by neighborhood",
+          x = "Mean Price", 
+          y = "Mean MAPE") +
+  scale_x_continuous(labels = scales::comma_format()) +
+     theme_minimal()
+```
+
+## 4.10 Testing generalizabilty
+
+By accounting for Zip Codes, our model's generalizability has improved
+as shown by the smaller gap in MAPE between race and income (Table 9 and
+10) for the regression with neighborhood effects compared to the
+baseline. However, it is still not generalizable because of the higher
+error rate differences across race and income contexts. The model is
+more likely to predict incorrectly for low income and majority non-white
+areas, compared to high income and majority white areas.
+
+```{r tidycensus, warning = FALSE, message = FALSE}
+grid.arrange(ncol = 2,
+  ggplot() + geom_sf(data = na.omit(tracts22), aes(fill = raceContext), color = "transparent") +
+    scale_fill_manual(values = c("#e0733c", "#92c3e3"), name="Race Context") +
+    labs(title = "Figure 18: Race Context") +
+    theme_void() + theme(legend.position="bottom"), 
+  ggplot() + geom_sf(data = na.omit(tracts22), aes(fill = incomeContext), color = "transparent") +
+    scale_fill_manual(values = c("#e0733c", "#92c3e3"), name="Income Context") +
+    labs(title = "Income Context") +
+    theme_void() + theme(legend.position="bottom"))
+```
+
+```{r income_race_1, warning = FALSE, message = FALSE, include = FALSE}
+reg.base <- lm(sale_price ~ ., data = as.data.frame(philly.training) %>% 
+                                 dplyr::select(sale_price,
+                                           total_livable_area,
+                                           exterior_condition,
+                                           fireplaces,
+                                           crime_nn9, 
+                                           SEPTA.Buffer))
+
+philly.test.base <- philly.test %>%
+  mutate(Regression = "Baseline Effects",
+         SalePrice.Predict = predict(reg.base, philly.test),
+         SalePrice.Error = SalePrice.Predict- sale_price,
+         SalePrice.AbsError = abs(SalePrice.Predict- sale_price),
+         SalePrice.APE = (abs(SalePrice.Predict- sale_price)) / sale_price)%>%
+  filter(sale_price < 1000000) %>%
+  filter(is.finite(SalePrice.Error)) 
+
+philly.test.base <- philly.test.base %>%
+  filter(is.finite(SalePrice.Error)) 
+```
+
+```{r income_race, warning = FALSE, message = FALSE, eval = FALSE}
+reg.base <- lm(sale_price ~ ., data = as.data.frame(philly.training) %>% 
+                                 dplyr::select(sale_price,
+                                           total_livable_area,
+                                           exterior_condition,
+                                           fireplaces,
+                                           crime_nn9, 
+                                           SEPTA.Buffer))
+
+philly.test.base <- philly.test %>%
+  mutate(Regression = "Baseline Effects",
+         SalePrice.Predict = predict(reg.base, philly.test),
+         SalePrice.Error = SalePrice.Predict- sale_price,
+         SalePrice.AbsError = abs(SalePrice.Predict- sale_price),
+         SalePrice.APE = (abs(SalePrice.Predict- sale_price)) / sale_price)%>%
+  filter(sale_price < 1000000) %>%
+  filter(is.finite(SalePrice.Error)) 
+
+philly.test.base <- philly.test.base %>%
+  filter(is.finite(SalePrice.Error)) 
+```
+
+```{r income_race_table, warning = FALSE, message = FALSE}
+coords.test.base <-  st_coordinates(philly.test.base) 
+
+neighborList.test.base <- knn2nb(knearneigh(coords.test.base, 5))
+
+spatialWeights.test.base <- nb2listw(neighborList.test.base, style="W")
+
+philly.test.base %>% 
+  mutate(lagPriceError = lag.listw(spatialWeights.test.base, philly.test.base$SalePrice.Error))
+
+bothRegressions <- 
+  rbind(
+    dplyr::select(philly.test.nhood, starts_with("sale_price"), Regression, census_tract,zip_code, SalePrice.Predict, SalePrice.Error, SalePrice.AbsError, SalePrice.APE),
+    dplyr::select(philly.test.base, starts_with("sale_price"), Regression, census_tract,zip_code, SalePrice.Predict, SalePrice.Error, SalePrice.AbsError, SalePrice.APE))   
+
+#Table for Income 
+st_join(bothRegressions, tracts22) %>% 
+  filter(!is.na(incomeContext)) %>%
+  group_by(Regression, incomeContext) %>%
+  summarize(mean.MAPE = scales::percent(mean(SalePrice.APE, na.rm = T))) %>%
+  st_drop_geometry() %>%
+  spread(incomeContext, mean.MAPE) %>%
+  kable(caption = "Table 9: Test set MAPE by neighborhood income context") %>%
+  kable_minimal()
+
+#Table for Race
+st_join(bothRegressions, tracts22) %>% 
+  group_by(Regression, raceContext) %>%
+  summarize(mean.MAPE = scales::percent(mean(SalePrice.APE, na.rm = T))) %>%
+  st_drop_geometry() %>%
+  spread(raceContext, mean.MAPE) %>%
+  select(-one_of("<NA>")) %>%
+  kable(caption = "Table 10: Test set MAPE by neighborhood racial context") %>%
+  kable_minimal()
+```
+
+# 5 Discussion
+
+This is not a very effective model. Vandalism/Criminal Mischief was an
+interesting variable that actually had a positive correlation with
+housing sale prices, contrary to prevailing perspectives.
+
+We obtained a value of 0.66 for the R-squared value of our linear
+regression indicating that our model is able to predict 66% of the
+variation in prices. The most important feature, as seen in the
+correlation matrix, would be the total livable area which has a value of
+0.6 suggesting that it is moderately correlated to housing sale prices.
+
+The MAE of our model is \$74,874.42 which is high compared to the median
+housing sale price of \$228,000. An MAE that is 25% of the average
+housing sale price shows a large average errors. The MAPE of 0.473
+suggest that our model has moderate accuracy.
+
+According to our maps, we could account for some spatial variation in
+prices. This is observed from the map where most of the sale prices in
+the center and southwest of Philadelphia appears to be in the lowest
+quintile. Sale Prices in northwest and northeast appear to be in the
+higher quintile. However, the spatial distribution is not uniform.
+
+The model predicted particularly well for housing sale prices around the
+price of \$250,000 based on the scatterplot of predicted prices as a
+function of observed prices (Figure 12). As prices increases/decreases
+further away from \$250,000, our model predicts housing sale prices more
+poorly. \$250,000 is near the median price range of \$228,000. This
+suggests that our model predicts well for houses nearer to the median
+housing price range and poorer for housing price values that are more
+extreme.
+
+# 6 Conclusion
+
+We would recommend our model to Zillow for predicting house prices near
+the median price range of \$250,000. If Zillow wishes to predict extreme
+housing sale prices, this model would not be recommended because of the
+lower accuracy. This model could be further improved by improving the
+accuracy and generalizability. This can be done by including variables
+with high correlation to the housing sale price but low correlation to
+other predictor variables. Ideally, the predictor variables should be
+inclusive of internal characteristics, amenities/public services or
+spatial structure to ensure a holistic model is created. By removing
+biased predictor variables and correcting for outliers, the model could
+also improve the generalizability to other cities.
+
+```{r Extact CSV, warning = FALSE, message = FALSE, include = FALSE}
+class<-data.frame(housing_values$musaID,housing_values$objectid,housing_values$toPredict)
+
+housing_values_for_predict<-philly.toPredict %>%
+  left_join(class,
+             by = c("objectid" = "housing_values.objectid"))
+
+pred<-predict(reg.training,
+              housing_values_for_predict[housing_values_for_predict$housing_values.toPredict=="CHALLENGE",])
+
+
+# Extract
+challenge_data <- housing_values_for_predict[housing_values_for_predict$housing_values.toPredict == "CHALLENGE", ]
+
+# Get the 'objectid' and predictions
+result <- data.frame(musaID = challenge_data$housing_values.musaID, prediction = pred)
+
+# Write the combined data to a CSV file
+write.csv(result, "mean_prediction.csv", row.names = FALSE)
+```
